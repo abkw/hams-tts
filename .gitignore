@@ -1,0 +1,21 @@
+# Data, checkpoints, caches — regenerable via scripts/, see README.md.
+# Model weights are published to Hugging Face, not committed here.
+data/
+.local-tools/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.venv/
+
+# Env/secrets
+.env
+.env.*
+
+# Editor/IDE
+.vscode/
+.claude/
+
+# The original project brief isn't ours to redistribute publicly.
+*.pdf

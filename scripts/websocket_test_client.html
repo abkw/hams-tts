@@ -1,0 +1,169 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>HamsTTS — test client</title>
+<style>
+  body { font-family: system-ui, sans-serif; max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+  textarea { width: 100%; height: 4rem; font-size: 1rem; direction: auto; }
+  select, button, input { font-size: 1rem; padding: 0.4rem 0.8rem; margin-top: 0.5rem; }
+  section { border: 1px solid #ccc; border-radius: 8px; padding: 1rem; margin-top: 1.5rem; }
+  h3 { margin-top: 0; }
+  #log { white-space: pre-wrap; background: #111; color: #0f0; padding: 1rem; height: 220px;
+         overflow-y: auto; font-family: monospace; font-size: 0.85rem; margin-top: 1rem; border-radius: 6px; }
+  #ttfa { font-weight: bold; margin-top: 0.5rem; }
+  audio { width: 100%; margin-top: 0.5rem; }
+  #http-status { margin-top: 0.5rem; font-family: monospace; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<h2>HamsTTS test client</h2>
+<p>Swagger's <code>/docs</code> page can open a WebSocket connection but
+can't send frames through it (so it just sits there — that's not a server
+bug), and its binary-response viewer for <code>POST /tts</code> doesn't
+give you a clickable player. Both are real client-side limitations of
+Swagger UI, not this server — this page is a real client for both.</p>
+
+<label>Server base: <input id="serverBase" value="http://127.0.0.1:8765" size="30"></label>
+
+<section>
+  <h3>1. Non-streaming (POST /tts) — simplest, returns a full WAV</h3>
+  <textarea id="text1">انا مشيت السوق</textarea>
+  <br>
+  <select id="lang1">
+    <option value="ar" selected>ar</option>
+    <option value="en">en</option>
+  </select>
+  <button id="speak1">Synthesize</button>
+  <div id="http-status"></div>
+  <audio id="player" controls></audio>
+</section>
+
+<section>
+  <h3>2. Streaming (WebSocket /tts/stream) — plays audio as each chunk arrives</h3>
+  <textarea id="text2">انا مشيت السوق</textarea>
+  <br>
+  <select id="lang2">
+    <option value="ar" selected>ar</option>
+    <option value="en">en</option>
+  </select>
+  <button id="speak2">Speak (streaming)</button>
+  <div id="ttfa"></div>
+  <div id="log"></div>
+</section>
+
+<script>
+const serverBase = () => document.getElementById('serverBase').value.replace(/\/$/, '');
+
+// --- 1. Non-streaming: fetch the WAV, play it in a normal <audio> element ---
+document.getElementById('speak1').addEventListener('click', async () => {
+  const statusEl = document.getElementById('http-status');
+  const player = document.getElementById('player');
+  statusEl.textContent = 'requesting...';
+  try {
+    const resp = await fetch(serverBase() + '/tts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: document.getElementById('text1').value,
+        lang_hint: document.getElementById('lang1').value,
+      }),
+    });
+    if (!resp.ok) {
+      statusEl.textContent = `HTTP ${resp.status}: ${await resp.text()}`;
+      return;
+    }
+    const blob = await resp.blob();
+    player.src = URL.createObjectURL(blob);
+    player.play();
+    statusEl.textContent = `OK — ${blob.size} bytes, playing`;
+  } catch (e) {
+    statusEl.textContent = 'fetch failed: ' + e;
+  }
+});
+
+// --- 2. Streaming: WebSocket, play each PCM16 chunk as it arrives ---
+const logEl = document.getElementById('log');
+function log(msg) {
+  logEl.textContent += msg + '\n';
+  logEl.scrollTop = logEl.scrollHeight;
+}
+
+const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+let playheadTime = 0;
+
+function pcm16ToFloat32(buf) {
+  const view = new DataView(buf);
+  const n = buf.byteLength / 2;
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    out[i] = view.getInt16(i * 2, true) / 32768;
+  }
+  return out;
+}
+
+function scheduleChunk(float32, sampleRate) {
+  const buffer = audioCtx.createBuffer(1, float32.length, sampleRate);
+  buffer.copyToChannel(float32, 0);
+  const source = audioCtx.createBufferSource();
+  source.buffer = buffer;
+  source.connect(audioCtx.destination);
+
+  const now = audioCtx.currentTime;
+  const startAt = Math.max(now, playheadTime);
+  source.start(startAt);
+  playheadTime = startAt + buffer.duration;
+}
+
+document.getElementById('speak2').addEventListener('click', () => {
+  logEl.textContent = '';
+  document.getElementById('ttfa').textContent = '';
+  playheadTime = audioCtx.currentTime;
+
+  const wsUrl = serverBase().replace(/^http/, 'ws') + '/tts/stream';
+  const text = document.getElementById('text2').value;
+  const lang_hint = document.getElementById('lang2').value;
+
+  const ws = new WebSocket(wsUrl);
+  ws.binaryType = 'arraybuffer';
+
+  const t0 = performance.now();
+  let gotFirstAudio = false;
+  let sampleRate = 16000;
+
+  ws.onopen = () => {
+    log('connected to ' + wsUrl + ', sending: ' + JSON.stringify({ text, lang_hint }));
+    ws.send(JSON.stringify({ text, lang_hint }));
+  };
+
+  ws.onmessage = (event) => {
+    if (event.data instanceof ArrayBuffer) {
+      if (!gotFirstAudio) {
+        gotFirstAudio = true;
+        const ttfa = (performance.now() - t0).toFixed(1);
+        document.getElementById('ttfa').textContent = `TTFA: ${ttfa} ms`;
+        log(`TTFA: ${ttfa} ms`);
+      }
+      log(`binary frame: ${event.data.byteLength} bytes`);
+      scheduleChunk(pcm16ToFloat32(event.data), sampleRate);
+      return;
+    }
+    const msg = JSON.parse(event.data);
+    log('message: ' + event.data);
+    if (msg.sampling_rate) sampleRate = msg.sampling_rate;
+    if (msg.type === 'error') {
+      log('ERROR: ' + msg.error);
+      ws.close();
+    }
+    if (msg.type === 'stream_end') {
+      log('stream ended, total latency: ' + (performance.now() - t0).toFixed(1) + ' ms');
+      ws.close();
+    }
+  };
+
+  ws.onerror = () => log('WebSocket error (see browser console for detail)');
+  ws.onclose = () => log('connection closed');
+});
+</script>
+</body>
+</html>
